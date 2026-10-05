@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"log"
 
@@ -56,23 +57,24 @@ const (
 var PullPushProtocol = "https"
 
 type containerImage struct {
-	index          v1.Index
-	indexHash      string
-	registry       string
-	repository     string
-	tag            string
-	url            string
-	platforms      []string
-	partitions     []partition
-	partitionTag   string
-	indexCache     cache.CacheStore
-	blobCache      cache.CacheStore
-	keyDigestCache cache.CacheStore
-	remoteCache    cache.RemoteCache
-	field          filesystem.Field
-	manifests      []v1.Manifest
-	configs        []v1.Image
-	cacheLock      sync.Mutex
+	index            v1.Index
+	indexHash        string
+	registry         string
+	repository       string
+	tag              string
+	url              string
+	platforms        []string
+	partitions       []partition
+	partitionTag     string
+	indexCache       cache.CacheStore
+	blobCache        cache.CacheStore
+	keyDigestCache   cache.CacheStore
+	remoteCache      cache.RemoteCache
+	field            filesystem.Field
+	manifests        []v1.Manifest
+	configs          []v1.Image
+	cacheLock        sync.Mutex
+	buildMeasurement *BuildMeasurement
 }
 
 type CacheKeys struct {
@@ -96,6 +98,7 @@ type Image interface {
 	AddField(manifest filesystem.TwoDFsManifest, targetImage string) error
 	GetIndex() []byte
 	GetExporter(args ...string) (FieldExporter, error)
+	GetBuildMeasurement() BuildMeasurement
 }
 
 /*
@@ -527,6 +530,18 @@ func (c *containerImage) GetIndex() []byte {
 	return index
 }
 
+func (c *containerImage) GetBuildMeasurement() BuildMeasurement {
+	if c.buildMeasurement == nil {
+		return BuildMeasurement{}
+	}
+
+	measurement := *c.buildMeasurement
+
+	measurement.Allotments = append([]AllotmentMeasurement(nil), c.buildMeasurement.Allotments...)
+
+	return measurement
+}
+
 func (c *containerImage) partition() error {
 
 	partitionAllotment := []filesystem.Allotment{}
@@ -832,6 +847,14 @@ func (c *containerImage) GetExporter(args ...string) (FieldExporter, error) {
 
 func (c *containerImage) buildField(manifest filesystem.TwoDFsManifest) (filesystem.Field, error) {
 
+	buildStart := time.Now()
+
+	c.buildMeasurement = newBuildMeasurement(len(manifest.Allotments))
+
+	defer func() {
+		c.buildMeasurement.TotalDuration = time.Since(buildStart)
+	}()
+
 	tmpFolder := filepath.Join(os.TempDir(), fmt.Sprintf("%x-field", c.indexHash))
 	if _, err := os.Stat(tmpFolder); err == nil {
 		os.RemoveAll(tmpFolder)
@@ -843,17 +866,24 @@ func (c *containerImage) buildField(manifest filesystem.TwoDFsManifest) (filesys
 	f := filesystem.GetField()
 
 	success := make(chan bool, len(manifest.Allotments))
-	for _, a := range manifest.Allotments {
-		go func() {
-			err := c.buildAllotment(a, f)
+
+	for i, a := range manifest.Allotments {
+		measurement := &c.buildMeasurement.Allotments[i]
+
+		go func(
+			allotment filesystem.AllotmentManifest,
+			measurement *AllotmentMeasurement,
+		) {
+			err := c.buildAllotment(allotment, f, measurement)
 			if err != nil {
 				success <- false
 				log.Default().Printf("ERROR: %v\n", err)
 			} else {
 				success <- true
 			}
-		}()
+		}(a, measurement)
 	}
+
 	terminate := false
 	for i := 0; i < len(manifest.Allotments); i++ {
 		if !<-success {
@@ -864,14 +894,27 @@ func (c *containerImage) buildField(manifest filesystem.TwoDFsManifest) (filesys
 		return nil, fmt.Errorf("error during allotment build procedure")
 	}
 
+	c.buildMeasurement.Success = true
+
 	return f, nil
 }
 
-func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesystem.Field) error {
+func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesystem.Field, measurement *AllotmentMeasurement) error {
+
+	allotmentStart := time.Now()
+
+	defer func() {
+		measurement.TotalDuration = time.Since(allotmentStart)
+	}()
 
 	fileSha, err := compress.CalculateMultiSha256Digest(a.Src.List)
 	if err != nil {
 		return err
+	}
+
+	keyDigest, keyErr := remoteKeyDigest(fileSha, a.Dst.List)
+	if keyErr == nil {
+		measurement.AllotmentKey = keyDigest
 	}
 
 	compressedSha, diffID := func() (string, string) {
@@ -905,15 +948,49 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 		diffID = ""
 	}
 
+	if compressedSha != "" {
+		measurement.Resolution = ResolutionLocal
+	}
+
 	// If no usable local cache entry exists, check the remote key cache to confirm if the blob is present in the remote cache
 	if compressedSha == "" {
+		remoteKeyLookupStart := time.Now()
+
 		remoteKey, found, err := c.lookupRemoteKey(fileSha, a.Dst.List)
+
+		if c.remoteCache != nil {
+			measurement.RemoteKeyLookupDuration = time.Since(remoteKeyLookupStart)
+
+			switch {
+			case err != nil:
+				measurement.RemoteKeyLookup = LookupError
+			case found:
+				measurement.RemoteKeyLookup = LookupHit
+			default:
+				measurement.RemoteKeyLookup = LookupMiss
+			}
+		}
+
 		if err != nil {
 			return err
 		}
 
 		if found {
+			remoteBlobRestoreStart := time.Now()
+
 			available, err := c.restoreRemoteBlob(remoteKey.CompressedSha)
+
+			measurement.RemoteBlobRestoreDuration = time.Since(remoteBlobRestoreStart)
+
+			switch {
+			case err != nil:
+				measurement.RemoteBlobLookup = LookupError
+			case available:
+				measurement.RemoteBlobLookup = LookupHit
+			default:
+				measurement.RemoteBlobLookup = LookupMiss
+			}
+
 			if err != nil {
 				return err
 			}
@@ -933,6 +1010,8 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 					return err
 				}
 
+				measurement.Resolution = ResolutionRemote
+
 				log.Printf("File %s [RESTORED] from remote cache\n", a.Src)
 			}
 		}
@@ -940,6 +1019,8 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 
 	// if no cache entry found, generate one
 	if compressedSha == "" {
+		buildStart := time.Now()
+
 		log.Printf("File %s [COPY] \n", a.Src)
 
 		tarPath, err := compress.TarFile(a.Src.List, a.Dst.List)
@@ -956,7 +1037,11 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 		diffID = compress.CalculateSha256Digest(tarReader)
 		tarReader.Seek(0, 0)
 
+		measurement.BuildDuration = time.Since(buildStart)
+
 		log.Printf("File %s [COMPRESSING] \n", a.Src)
+
+		compressionStart := time.Now()
 
 		archiveName, err := compress.TarToGz(tarPath)
 		if err != nil {
@@ -969,6 +1054,8 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 		defer archive.Close()
 		defer os.Remove(archiveName)
 		compressedSha = compress.CalculateSha256Digest(archive)
+
+		measurement.CompressionDuration = time.Since(compressionStart)
 
 		//add uncompressed allotment cache reference
 		c.cacheLock.Lock()
@@ -994,10 +1081,19 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 			}
 			log.Printf("Allotment %d/%d %s [CREATED] \n", a.Row, a.Col, compressedSha)
 		}
+
+		measurement.Resolution = ResolutionRebuild
 	}
 
 	// push blob to remote cache if needed
+	remoteBlobPushStart := time.Now()
+
 	err = c.ensureRemoteBlob(compressedSha)
+
+	if c.remoteCache != nil {
+		measurement.RemoteBlobPushDuration = time.Since(remoteBlobPushStart)
+	}
+
 	if err != nil {
 		return err
 	}
