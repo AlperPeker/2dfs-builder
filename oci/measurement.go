@@ -1,6 +1,8 @@
 package oci
 
-import "time"
+import (
+	"time"
+)
 
 type AllotmentResolution string
 

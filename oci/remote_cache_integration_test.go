@@ -203,7 +203,7 @@ func TestRestoreRemoteBlobRestoresMatchingDigest(t *testing.T) {
 		},
 	}
 
-	available, err := container.restoreRemoteBlob(compressedSha)
+	available, _, err := container.restoreRemoteBlob(compressedSha)
 	if err != nil {
 		t.Fatalf("restoreRemoteBlob returned error: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestRestoreRemoteBlobRejectsDigestMismatch(t *testing.T) {
 		},
 	}
 
-	available, err := container.restoreRemoteBlob(compressedSha)
+	available, _, err := container.restoreRemoteBlob(compressedSha)
 	if err == nil {
 		t.Fatalf("expected digest mismatch error")
 	}
@@ -277,7 +277,7 @@ func TestRestoreRemoteBlobReturnsStreamError(t *testing.T) {
 		},
 	}
 
-	available, err := container.restoreRemoteBlob(
+	available, _, err := container.restoreRemoteBlob(
 		compressedSha,
 	)
 

@@ -94,6 +94,11 @@ type partition struct {
 	y2 int
 }
 
+type countingReader struct {
+	reader io.Reader
+	bytes  int64
+}
+
 type Image interface {
 	AddField(manifest filesystem.TwoDFsManifest, targetImage string) error
 	GetIndex() []byte
@@ -978,9 +983,10 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 		if found {
 			remoteBlobRestoreStart := time.Now()
 
-			available, err := c.restoreRemoteBlob(remoteKey.CompressedSha)
+			available, bytesDownloaded, err := c.restoreRemoteBlob(remoteKey.CompressedSha)
 
 			measurement.RemoteBlobRestoreDuration = time.Since(remoteBlobRestoreStart)
+			measurement.RemoteArtifactBytesDownloaded += bytesDownloaded
 
 			switch {
 			case err != nil:
@@ -1088,10 +1094,11 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	// push blob to remote cache if needed
 	remoteBlobPushStart := time.Now()
 
-	err = c.ensureRemoteBlob(compressedSha)
+	uploadedBytes, err := c.ensureRemoteBlob(compressedSha)
 
 	if c.remoteCache != nil {
 		measurement.RemoteBlobPushDuration = time.Since(remoteBlobPushStart)
+		measurement.RemoteArtifactBytesUploaded += uploadedBytes
 	}
 
 	if err != nil {
@@ -1115,34 +1122,42 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	return nil
 }
 
-func (c *containerImage) ensureRemoteBlob(compressedSha string) error {
+func (c *containerImage) ensureRemoteBlob(compressedSha string) (int64, error) {
 	if c.remoteCache == nil {
-		return nil
+		return 0, nil
 	}
 
 	exists, err := c.remoteCache.CheckBlob(compressedSha)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	if exists {
 		log.Printf("Blob %s is already [CACHED] in remote registry\n", compressedSha)
-		return nil
+		return 0, nil
 	}
 
 	reader, err := c.blobCache.Get(compressedSha)
 	if err != nil {
-		return fmt.Errorf("Failed to read local blob %s for remote cache push: %w", compressedSha, err)
+		return 0, fmt.Errorf("Failed to read local blob %s for remote cache push: %w", compressedSha, err)
 	}
 	defer reader.Close()
 
-	err = c.remoteCache.PushBlob(compressedSha, reader)
+	countedReader := &countingReader{reader: reader}
+
+	err = c.remoteCache.PushBlob(compressedSha, countedReader)
 	if err != nil {
-		return err
+		return countedReader.bytes, err
 	}
 
 	log.Printf("Blob %s [PUSHED] to remote cache\n", compressedSha)
-	return nil
+	return countedReader.bytes, nil
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.bytes += int64(n)
+	return n, err
 }
 
 func normalizeSHA256Digest(compressedSha string) string {
@@ -1222,14 +1237,14 @@ func (c *containerImage) lookupRemoteKey(fileSha string, dst []string) (filesyst
 	return key, true, nil
 }
 
-func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, error) {
+func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, int64, error) {
 	if c.blobCache.Check(compressedSha) {
-		return true, nil
+		return true, 0, nil
 	}
 
 	if c.remoteCache == nil {
 		log.Printf("Blob %s [MISSING] in local cache and no remote cache configured\n", compressedSha)
-		return false, nil
+		return false, 0, nil
 	}
 
 	log.Printf("Blob %s [MISSING] in local cache, trying remote cache restore\n", compressedSha)
@@ -1242,16 +1257,16 @@ func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, error) {
 
 		if errors.Is(err, cache.ErrRemoteCacheMiss) {
 			log.Printf("Blob %s remote cache restore [MISS]: %v\n", compressedSha, err)
-			return false, nil
+			return false, 0, nil
 		}
 
-		return false, fmt.Errorf("Failed to pull blob %s from remote cache: %w", compressedSha, err)
+		return false, 0, fmt.Errorf("Failed to pull blob %s from remote cache: %w", compressedSha, err)
 	}
 	defer reader.Close()
 
 	blobWriter, err := c.blobCache.Add(compressedSha)
 	if err != nil {
-		return false, fmt.Errorf("Failed to create local blob cache entry for remote restore %s: %w", compressedSha, err)
+		return false, 0, fmt.Errorf("Failed to create local blob cache entry for remote restore %s: %w", compressedSha, err)
 	}
 
 	writerClosed := false
@@ -1265,7 +1280,7 @@ func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, error) {
 	digestHash := sha256.New()
 	copyBuffer := make([]byte, 1024*1024)
 
-	_, err = io.CopyBuffer(io.MultiWriter(blobWriter, digestHash), reader, copyBuffer)
+	bytesDownloaded, err := io.CopyBuffer(io.MultiWriter(blobWriter, digestHash), reader, copyBuffer)
 
 	calculatedCompressedSha := fmt.Sprintf("%x", digestHash.Sum(nil))
 	expectedCompressedSha := normalizeSHA256Digest(compressedSha)
@@ -1276,27 +1291,27 @@ func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, error) {
 	if err != nil {
 		c.blobCache.Del(compressedSha)
 
-		return false, fmt.Errorf("Failed to restore blob %s from remote cache: %w", compressedSha, err)
+		return false, bytesDownloaded, fmt.Errorf("Failed to restore blob %s from remote cache: %w", compressedSha, err)
 	}
 
 	if closeErr != nil {
 		c.blobCache.Del(compressedSha)
 		log.Printf("Blob %s remote cache restore [FAILED]: %v\n", compressedSha, closeErr)
-		return false, fmt.Errorf("Failed to close local blob cache entry after remote restore: %s: %w", compressedSha, closeErr)
+		return false, bytesDownloaded, fmt.Errorf("Failed to close local blob cache entry after remote restore: %s: %w", compressedSha, closeErr)
 	}
 
 	if !strings.EqualFold(calculatedCompressedSha, expectedCompressedSha) {
 		c.blobCache.Del(compressedSha)
-		return false, fmt.Errorf("Pulled blob digest mismatch: expected sha256:%s, got sha256:%s", expectedCompressedSha, calculatedCompressedSha)
+		return false, bytesDownloaded, fmt.Errorf("Pulled blob digest mismatch: expected sha256:%s, got sha256:%s", expectedCompressedSha, calculatedCompressedSha)
 	}
 
 	if !c.blobCache.Check(compressedSha) {
 		c.blobCache.Del(compressedSha)
-		return false, fmt.Errorf("Restored blob %s failed local integrity check", compressedSha)
+		return false, bytesDownloaded, fmt.Errorf("Restored blob %s failed local integrity check", compressedSha)
 	}
 
 	log.Printf("Blob %s [RESTORED] from remote cache\n", compressedSha)
-	return true, nil
+	return true, bytesDownloaded, nil
 }
 
 func createFileWithDirs(p string) (*os.File, error) {
