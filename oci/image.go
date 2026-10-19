@@ -1092,12 +1092,10 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	}
 
 	// push blob to remote cache if needed
-	remoteBlobPushStart := time.Now()
-
-	uploadedBytes, err := c.ensureRemoteBlob(compressedSha)
+	uploadedBytes, remoteBlobPushDuration, err := c.ensureRemoteBlob(compressedSha)
 
 	if c.remoteCache != nil {
-		measurement.RemoteBlobPushDuration = time.Since(remoteBlobPushStart)
+		measurement.RemoteBlobPushDuration = remoteBlobPushDuration
 		measurement.RemoteArtifactBytesUploaded += uploadedBytes
 	}
 
@@ -1122,36 +1120,39 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	return nil
 }
 
-func (c *containerImage) ensureRemoteBlob(compressedSha string) (int64, error) {
+func (c *containerImage) ensureRemoteBlob(compressedSha string) (int64, time.Duration, error) {
 	if c.remoteCache == nil {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	exists, err := c.remoteCache.CheckBlob(compressedSha)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	if exists {
 		log.Printf("Blob %s is already [CACHED] in remote registry\n", compressedSha)
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	reader, err := c.blobCache.Get(compressedSha)
 	if err != nil {
-		return 0, fmt.Errorf("Failed to read local blob %s for remote cache push: %w", compressedSha, err)
+		return 0, 0, fmt.Errorf("Failed to read local blob %s for remote cache push: %w", compressedSha, err)
 	}
 	defer reader.Close()
 
 	countedReader := &countingReader{reader: reader}
 
+	pushStart := time.Now()
 	err = c.remoteCache.PushBlob(compressedSha, countedReader)
+	pushDuration := time.Since(pushStart)
+
 	if err != nil {
-		return countedReader.bytes, err
+		return countedReader.bytes, pushDuration, err
 	}
 
 	log.Printf("Blob %s [PUSHED] to remote cache\n", compressedSha)
-	return countedReader.bytes, nil
+	return countedReader.bytes, pushDuration, nil
 }
 
 func (r *countingReader) Read(p []byte) (int, error) {

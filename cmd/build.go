@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -91,6 +92,15 @@ func build(imgFrom string, imgTarget string) error {
 		return err
 	}
 	log.Default().Println("Field Added")
+
+	measurement := ociImage.GetBuildMeasurement()
+
+	benchmarkPath, err := measurement.ExportCSV("benchmark-results")
+	if err != nil {
+		return fmt.Errorf("failed to export build measurements: %w", err)
+	}
+
+	log.Default().Printf("Build measurements exported to %s\n", benchmarkPath)
 
 	// export the image is "as" was set
 	if exportFormat != "" {
