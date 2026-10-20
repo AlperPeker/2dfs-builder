@@ -61,6 +61,67 @@ func testSHA256Hex(data []byte) string {
 	return fmt.Sprintf("%x", hash[:])
 }
 
+type partialFailureReadCloser struct {
+	data      []byte
+	offset    int
+	failAfter int
+}
+
+func (r *partialFailureReadCloser) Read(p []byte) (int, error) {
+	if r.offset >= r.failAfter {
+		return 0, io.ErrUnexpectedEOF
+	}
+
+	remaining := r.failAfter - r.offset
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+
+	n := copy(p, r.data[r.offset:])
+	r.offset += n
+
+	return n, nil
+}
+
+func (r *partialFailureReadCloser) Close() error {
+	return nil
+}
+
+type retryingRemoteCache struct {
+	blob      []byte
+	pullCalls int
+	failAfter int
+}
+
+func (f *retryingRemoteCache) CheckBlob(compressedSha string) (bool, error) {
+	return false, nil
+}
+
+func (f *retryingRemoteCache) PushBlob(compressedSha string, r io.Reader) error {
+	return nil
+}
+
+func (f *retryingRemoteCache) PullBlob(compressedSha string) (io.ReadCloser, error) {
+	f.pullCalls++
+
+	if f.pullCalls == 1 {
+		return &partialFailureReadCloser{
+			data:      f.blob,
+			failAfter: f.failAfter,
+		}, nil
+	}
+
+	return io.NopCloser(bytes.NewReader(f.blob)), nil
+}
+
+func (f *retryingRemoteCache) PushKey(keyDigest string, reader io.Reader) error {
+	return nil
+}
+
+func (f *retryingRemoteCache) PullKey(keyDigest string) (io.ReadCloser, error) {
+	return nil, cache.ErrRemoteCacheMiss
+}
+
 func TestNewRemoteCacheFromContext(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -299,5 +360,58 @@ func TestRestoreRemoteBlobReturnsStreamError(t *testing.T) {
 	blobPath := filepath.Join(blobCacheDir, compressedSha)
 	if _, statErr := os.Stat(blobPath); !os.IsNotExist(statErr) {
 		t.Fatal("expected incomplete local blob entry to be deleted")
+	}
+}
+
+func TestRestoreRemoteBlobRetriesInterruptedStream(t *testing.T) {
+	blob := []byte("valid remote blob content")
+	compressedSha := testSHA256Hex(blob)
+	failAfter := 5
+
+	blobCacheDir := t.TempDir()
+	blobCache, err := cache.NewCacheStore(blobCacheDir)
+	if err != nil {
+		t.Fatalf("NewCacheStore returned error: %v", err)
+	}
+
+	remoteCache := &retryingRemoteCache{
+		blob:      blob,
+		failAfter: failAfter,
+	}
+
+	container := &containerImage{
+		blobCache:   blobCache,
+		remoteCache: remoteCache,
+	}
+
+	available, bytesDownloaded, err := container.restoreRemoteBlob(compressedSha)
+	if err != nil {
+		t.Fatalf("restoreRemoteBlob returned error: %v", err)
+	}
+
+	if !available {
+		t.Fatal("expected blob to be restored after retry")
+	}
+
+	if remoteCache.pullCalls != 2 {
+		t.Fatalf("expected 2 PullBlob calls, got %d", remoteCache.pullCalls)
+	}
+
+	expectedBytesDownloaded := int64(failAfter + len(blob))
+	if bytesDownloaded != expectedBytesDownloaded {
+		t.Fatalf(
+			"expected %d downloaded bytes across retries, got %d",
+			expectedBytesDownloaded,
+			bytesDownloaded,
+		)
+	}
+
+	restoredBlob, err := os.ReadFile(filepath.Join(blobCacheDir, compressedSha))
+	if err != nil {
+		t.Fatalf("failed to read restored blob: %v", err)
+	}
+
+	if !bytes.Equal(restoredBlob, blob) {
+		t.Fatal("restored blob does not match remote blob")
 	}
 }

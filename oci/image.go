@@ -1250,69 +1250,101 @@ func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, int64, e
 
 	log.Printf("Blob %s [MISSING] in local cache, trying remote cache restore\n", compressedSha)
 
-	reader, err := c.remoteCache.PullBlob(compressedSha)
-	if err != nil {
-		if reader != nil {
-			_ = reader.Close()
+	var totalBytesDownloaded int64
+
+	_, err := cache.RetryRemoteOperation("restore blob", func() error {
+		reader, err := c.remoteCache.PullBlob(compressedSha)
+		if err != nil {
+			if reader != nil {
+				_ = reader.Close()
+			}
+
+			return err
+		}
+		defer reader.Close()
+
+		blobWriter, err := c.blobCache.Add(compressedSha)
+		if err != nil {
+			return fmt.Errorf(
+				"Failed to create local blob cache entry for remote restore %s: %w",
+				compressedSha,
+				err,
+			)
 		}
 
+		digestHash := sha256.New()
+		copyBuffer := make([]byte, 1024*1024)
+
+		bytesDownloaded, copyErr := io.CopyBuffer(
+			io.MultiWriter(blobWriter, digestHash),
+			reader,
+			copyBuffer,
+		)
+
+		totalBytesDownloaded += bytesDownloaded
+
+		calculatedCompressedSha := fmt.Sprintf("%x", digestHash.Sum(nil))
+		expectedCompressedSha := normalizeSHA256Digest(compressedSha)
+
+		closeErr := blobWriter.Close()
+
+		if copyErr != nil {
+			c.blobCache.Del(compressedSha)
+
+			return fmt.Errorf(
+				"Failed to restore blob %s from remote cache: %w",
+				compressedSha,
+				copyErr,
+			)
+		}
+
+		if closeErr != nil {
+			c.blobCache.Del(compressedSha)
+
+			return fmt.Errorf(
+				"Failed to close local blob cache entry after remote restore %s: %w",
+				compressedSha,
+				closeErr,
+			)
+		}
+
+		if !strings.EqualFold(calculatedCompressedSha, expectedCompressedSha) {
+			c.blobCache.Del(compressedSha)
+
+			return fmt.Errorf(
+				"Pulled blob digest mismatch: expected sha256:%s, got sha256:%s",
+				expectedCompressedSha,
+				calculatedCompressedSha,
+			)
+		}
+
+		if !c.blobCache.Check(compressedSha) {
+			c.blobCache.Del(compressedSha)
+
+			return fmt.Errorf(
+				"Restored blob %s failed local integrity check",
+				compressedSha,
+			)
+		}
+
+		return nil
+	})
+
+	if err != nil {
 		if errors.Is(err, cache.ErrRemoteCacheMiss) {
 			log.Printf("Blob %s remote cache restore [MISS]: %v\n", compressedSha, err)
-			return false, 0, nil
+			return false, totalBytesDownloaded, nil
 		}
 
-		return false, 0, fmt.Errorf("Failed to pull blob %s from remote cache: %w", compressedSha, err)
-	}
-	defer reader.Close()
-
-	blobWriter, err := c.blobCache.Add(compressedSha)
-	if err != nil {
-		return false, 0, fmt.Errorf("Failed to create local blob cache entry for remote restore %s: %w", compressedSha, err)
-	}
-
-	writerClosed := false
-	defer func() {
-		if !writerClosed {
-			_ = blobWriter.Close()
-			c.blobCache.Del(compressedSha)
-		}
-	}()
-
-	digestHash := sha256.New()
-	copyBuffer := make([]byte, 1024*1024)
-
-	bytesDownloaded, err := io.CopyBuffer(io.MultiWriter(blobWriter, digestHash), reader, copyBuffer)
-
-	calculatedCompressedSha := fmt.Sprintf("%x", digestHash.Sum(nil))
-	expectedCompressedSha := normalizeSHA256Digest(compressedSha)
-
-	closeErr := blobWriter.Close()
-	writerClosed = true
-
-	if err != nil {
-		c.blobCache.Del(compressedSha)
-
-		return false, bytesDownloaded, fmt.Errorf("Failed to restore blob %s from remote cache: %w", compressedSha, err)
-	}
-
-	if closeErr != nil {
-		c.blobCache.Del(compressedSha)
-		log.Printf("Blob %s remote cache restore [FAILED]: %v\n", compressedSha, closeErr)
-		return false, bytesDownloaded, fmt.Errorf("Failed to close local blob cache entry after remote restore: %s: %w", compressedSha, closeErr)
-	}
-
-	if !strings.EqualFold(calculatedCompressedSha, expectedCompressedSha) {
-		c.blobCache.Del(compressedSha)
-		return false, bytesDownloaded, fmt.Errorf("Pulled blob digest mismatch: expected sha256:%s, got sha256:%s", expectedCompressedSha, calculatedCompressedSha)
-	}
-
-	if !c.blobCache.Check(compressedSha) {
-		c.blobCache.Del(compressedSha)
-		return false, bytesDownloaded, fmt.Errorf("Restored blob %s failed local integrity check", compressedSha)
+		return false, totalBytesDownloaded, fmt.Errorf(
+			"Failed to pull blob %s from remote cache: %w",
+			compressedSha,
+			err,
+		)
 	}
 
 	log.Printf("Blob %s [RESTORED] from remote cache\n", compressedSha)
-	return true, bytesDownloaded, nil
+	return true, totalBytesDownloaded, nil
 }
 
 func createFileWithDirs(p string) (*os.File, error) {

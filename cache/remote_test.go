@@ -754,7 +754,7 @@ func TestPushKeyStoresKeyUnderKeyTagInRegistry(t *testing.T) {
 func TestRetryRemoteOperationRetriesTransientError(t *testing.T) {
 	attempts := 0
 
-	retries, err := retryRemoteOperation("test operation", func() error {
+	retries, err := RetryRemoteOperation("test operation", func() error {
 		attempts++
 
 		if attempts < 3 {
@@ -782,7 +782,7 @@ func TestRetryRemoteOperationRetriesTransientError(t *testing.T) {
 func TestRetryRemoteOperationDoesNotRetryNotFound(t *testing.T) {
 	attempts := 0
 
-	retries, err := retryRemoteOperation("test operation", func() error {
+	retries, err := RetryRemoteOperation("test operation", func() error {
 		attempts++
 
 		return &transport.Error{
@@ -806,7 +806,7 @@ func TestRetryRemoteOperationDoesNotRetryNotFound(t *testing.T) {
 func TestRetryRemoteOperationStopsAfterMaxAttempts(t *testing.T) {
 	attempts := 0
 
-	retries, err := retryRemoteOperation("test operation", func() error {
+	retries, err := RetryRemoteOperation("test operation", func() error {
 		attempts++
 		return io.ErrUnexpectedEOF
 	})
