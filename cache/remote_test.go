@@ -577,7 +577,7 @@ func TestPullBlobReturnsOriginalCompressedBlobFromRegistry(t *testing.T) {
 
 	c := newTestRemoteCache(t, "2dfs/cache-pull-test")
 
-	err := c.PushBlob(compressedSha, bytes.NewReader(blob))
+	_, err := c.PushBlob(compressedSha, bytes.NewReader(blob))
 	if err != nil {
 		t.Fatalf("PushBlob() error: %v", err)
 	}
@@ -614,12 +614,12 @@ func TestPushKeyPullKeyReturnsOriginalMetadataFromRegistry(t *testing.T) {
 
 	c := newTestRemoteCache(t, "2dfs/cache-key-test")
 
-	err := c.PushKey(keyDigest, bytes.NewReader(keyMetadata))
+	_, err := c.PushKey(keyDigest, bytes.NewReader(keyMetadata))
 	if err != nil {
 		t.Fatalf("PushKey() error: %v", err)
 	}
 
-	reader, err := c.PullKey(keyDigest)
+	reader, _, err := c.PullKey(keyDigest)
 	if err != nil {
 		t.Fatalf("PullKey() error: %v", err)
 	}
@@ -685,7 +685,7 @@ func TestPullKeyReturnsErrRemoteCacheMissWhenKeyIsMissing(t *testing.T) {
 
 	c := newTestRemoteCache(t, "2dfs/cache-key-missing-test")
 
-	reader, err := c.PullKey(missingKeyDigest)
+	reader, _, err := c.PullKey(missingKeyDigest)
 
 	t.Logf("output reader is nil: %t", reader == nil)
 	t.Logf("output error: %v", err)
@@ -724,7 +724,7 @@ func TestPushKeyStoresKeyUnderKeyTagInRegistry(t *testing.T) {
 
 	c := NewRemoteCache(registryURL, repository, true)
 
-	err := c.PushKey(keyDigest, bytes.NewReader(keyMetadata))
+	_, err := c.PushKey(keyDigest, bytes.NewReader(keyMetadata))
 	if err != nil {
 		t.Fatalf("PushKey() error: %v", err)
 	}

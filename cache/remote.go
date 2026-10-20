@@ -33,12 +33,12 @@ const (
 )
 
 type RemoteCache interface {
-	CheckBlob(compressedSha string) (bool, error)
-	PushBlob(compressedSha string, r io.Reader) error
+	CheckBlob(compressedSha string) (bool, int, error)
+	PushBlob(compressedSha string, r io.Reader) (int, error)
 	PullBlob(compressedSha string) (io.ReadCloser, error)
 
-	PushKey(keyDigest string, reader io.Reader) error
-	PullKey(keyDigest string) (io.ReadCloser, error)
+	PushKey(keyDigest string, reader io.Reader) (int, error)
+	PullKey(keyDigest string) (io.ReadCloser, int, error)
 }
 
 type remoteCache struct {
@@ -59,56 +59,56 @@ func NewRemoteCache(registryURL, repository string, insecure bool) RemoteCache {
 	}
 }
 
-func (c *remoteCache) CheckBlob(compressedSha string) (bool, error) {
+func (c *remoteCache) CheckBlob(compressedSha string) (bool, int, error) {
 	ref, err := c.reference(blobTag(compressedSha), "blob")
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 
 	var img v1.Image
-	_, err = RetryRemoteOperation("check blob", func() error {
+	retries, err := RetryRemoteOperation("check blob", func() error {
 		var remoteErr error
 		img, remoteErr = remote.Image(ref, c.options...)
 		return remoteErr
 	})
 	if err != nil {
 		if isRemoteCacheMiss(err) {
-			return false, nil
+			return false, retries, nil
 		}
-		return false, fmt.Errorf("Failed to fetch blob from remote cache: %w", err)
+		return false, retries, fmt.Errorf("Failed to fetch blob from remote cache: %w", err)
 	}
 
 	err = c.validateBlobImage(img, compressedSha)
 	if err != nil {
-		return false, fmt.Errorf("Invalid blob image in remote cache: %w", err)
+		return false, retries, fmt.Errorf("Invalid blob image in remote cache: %w", err)
 	}
 
-	return true, nil
+	return true, retries, nil
 }
 
 // Get tar.gz allotment blob from the reader and push it to the registry as a single-layer OCI image
-func (c *remoteCache) PushBlob(compressedSha string, r io.Reader) error {
+func (c *remoteCache) PushBlob(compressedSha string, r io.Reader) (int, error) {
 	img, cleanup, err := c.createBlobImage(compressedSha, r)
 	if cleanup != nil {
 		defer cleanup()
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	ref, err := c.reference(blobTag(compressedSha), "blob")
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	_, err = RetryRemoteOperation("push blob", func() error {
+	retries, err := RetryRemoteOperation("push blob", func() error {
 		return remote.Write(ref, img, c.options...)
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to push blob image to remote cache: %w", err)
+		return retries, fmt.Errorf("Failed to push blob image to remote cache: %w", err)
 	}
 
-	return nil
+	return retries, nil
 }
 
 func (c *remoteCache) createBlobImage(compressedSha string, r io.Reader) (v1.Image, func(), error) {
@@ -288,36 +288,36 @@ func (c *remoteCache) PullBlob(compressedSha string) (io.ReadCloser, error) {
 	return reader, nil
 }
 
-func (c *remoteCache) PushKey(keyDigest string, reader io.Reader) error {
+func (c *remoteCache) PushKey(keyDigest string, reader io.Reader) (int, error) {
 	img, err := createKeyImage(reader)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	ref, err := c.reference(keyTag(keyDigest), "key")
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	_, err = RetryRemoteOperation("push key", func() error {
+	retries, err := RetryRemoteOperation("push key", func() error {
 		return remote.Write(ref, img, c.options...)
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to push key image to remote cache: %w", err)
+		return retries, fmt.Errorf("Failed to push key image to remote cache: %w", err)
 	}
 
-	return nil
+	return retries, nil
 }
 
-func (c *remoteCache) PullKey(keyDigest string) (io.ReadCloser, error) {
+func (c *remoteCache) PullKey(keyDigest string) (io.ReadCloser, int, error) {
 	ref, err := c.reference(keyTag(keyDigest), "key")
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	var img v1.Image
 
-	_, err = RetryRemoteOperation("pull key", func() error {
+	retries, err := RetryRemoteOperation("pull key", func() error {
 		var remoteErr error
 		img, remoteErr = remote.Image(ref, c.options...)
 		return remoteErr
@@ -325,27 +325,27 @@ func (c *remoteCache) PullKey(keyDigest string) (io.ReadCloser, error) {
 
 	if err != nil {
 		if isRemoteCacheMiss(err) {
-			return nil, fmt.Errorf("Key %s not found in remote cache: %w", keyDigest, ErrRemoteCacheMiss)
+			return nil, retries, fmt.Errorf("Key %s not found in remote cache: %w", keyDigest, ErrRemoteCacheMiss)
 		}
-		return nil, fmt.Errorf("Failed to fetch key from remote cache: %w", err)
+		return nil, retries, fmt.Errorf("Failed to fetch key from remote cache: %w", err)
 	}
 
 	err = c.validateKeyImage(img)
 	if err != nil {
-		return nil, fmt.Errorf("Invalid key image in remote cache: %w", err)
+		return nil, retries, fmt.Errorf("Invalid key image in remote cache: %w", err)
 	}
 
 	layers, err := img.Layers()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get key layers: %w", err)
+		return nil, retries, fmt.Errorf("Failed to get key layers: %w", err)
 	}
 
 	reader, err := layers[0].Compressed()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to open compressed key layer from cache: %w", err)
+		return nil, retries, fmt.Errorf("Failed to open compressed key layer from cache: %w", err)
 	}
 
-	return reader, nil
+	return reader, retries, nil
 }
 
 func createKeyImage(reader io.Reader) (v1.Image, error) {

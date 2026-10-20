@@ -961,7 +961,8 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	if compressedSha == "" {
 		remoteKeyLookupStart := time.Now()
 
-		remoteKey, found, err := c.lookupRemoteKey(fileSha, a.Dst.List)
+		remoteKey, found, remoteKeyRetries, err := c.lookupRemoteKey(fileSha, a.Dst.List)
+		measurement.RemoteRetryCount += remoteKeyRetries
 
 		if c.remoteCache != nil {
 			measurement.RemoteKeyLookupDuration = time.Since(remoteKeyLookupStart)
@@ -983,8 +984,9 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 		if found {
 			remoteBlobRestoreStart := time.Now()
 
-			available, bytesDownloaded, err := c.restoreRemoteBlob(remoteKey.CompressedSha)
+			available, bytesDownloaded, restoreRetries, err := c.restoreRemoteBlob(remoteKey.CompressedSha)
 
+			measurement.RemoteRetryCount += restoreRetries
 			measurement.RemoteBlobRestoreDuration = time.Since(remoteBlobRestoreStart)
 			measurement.RemoteArtifactBytesDownloaded += bytesDownloaded
 
@@ -1092,7 +1094,9 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	}
 
 	// push blob to remote cache if needed
-	uploadedBytes, remoteBlobPushDuration, err := c.ensureRemoteBlob(compressedSha)
+	uploadedBytes, remoteBlobPushDuration, blobRetries, err := c.ensureRemoteBlob(compressedSha)
+
+	measurement.RemoteRetryCount += blobRetries
 
 	if c.remoteCache != nil {
 		measurement.RemoteBlobPushDuration = remoteBlobPushDuration
@@ -1104,7 +1108,8 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	}
 
 	// publish the remote key only after the referenced blob is available remotely
-	err = c.publishRemoteKey(fileSha, a.Dst.List, compressedSha, diffID)
+	keyPushRetries, err := c.publishRemoteKey(fileSha, a.Dst.List, compressedSha, diffID)
+	measurement.RemoteRetryCount += keyPushRetries
 	if err != nil {
 		return err
 	}
@@ -1120,39 +1125,40 @@ func (c *containerImage) buildAllotment(a filesystem.AllotmentManifest, f filesy
 	return nil
 }
 
-func (c *containerImage) ensureRemoteBlob(compressedSha string) (int64, time.Duration, error) {
+func (c *containerImage) ensureRemoteBlob(compressedSha string) (int64, time.Duration, int, error) {
 	if c.remoteCache == nil {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 
-	exists, err := c.remoteCache.CheckBlob(compressedSha)
+	exists, checkRetries, err := c.remoteCache.CheckBlob(compressedSha)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, checkRetries, err
 	}
 
 	if exists {
 		log.Printf("Blob %s is already [CACHED] in remote registry\n", compressedSha)
-		return 0, 0, nil
+		return 0, 0, checkRetries, nil
 	}
 
 	reader, err := c.blobCache.Get(compressedSha)
 	if err != nil {
-		return 0, 0, fmt.Errorf("Failed to read local blob %s for remote cache push: %w", compressedSha, err)
+		return 0, 0, checkRetries, fmt.Errorf("Failed to read local blob %s for remote cache push: %w", compressedSha, err)
 	}
 	defer reader.Close()
 
 	countedReader := &countingReader{reader: reader}
 
 	pushStart := time.Now()
-	err = c.remoteCache.PushBlob(compressedSha, countedReader)
+	pushRetries, err := c.remoteCache.PushBlob(compressedSha, countedReader)
 	pushDuration := time.Since(pushStart)
+	totalRetries := checkRetries + pushRetries
 
 	if err != nil {
-		return countedReader.bytes, pushDuration, err
+		return countedReader.bytes, pushDuration, totalRetries, err
 	}
 
 	log.Printf("Blob %s [PUSHED] to remote cache\n", compressedSha)
-	return countedReader.bytes, pushDuration, nil
+	return countedReader.bytes, pushDuration, totalRetries, nil
 }
 
 func (r *countingReader) Read(p []byte) (int, error) {
@@ -1168,45 +1174,49 @@ func normalizeSHA256Digest(compressedSha string) string {
 	return strings.ToLower(normalized)
 }
 
-func (c *containerImage) publishRemoteKey(fileSha string, dst []string, compressedSha string, diffID string) error {
+func (c *containerImage) publishRemoteKey(fileSha string, dst []string, compressedSha string, diffID string) (int, error) {
 	if c.remoteCache == nil {
-		return nil
+		return 0, nil
 	}
 
 	keyDigest, err := remoteKeyDigest(fileSha, dst)
 	if err != nil {
-		return fmt.Errorf("failed to calculate remote cache key digest: %w", err)
+		return 0, fmt.Errorf("failed to calculate remote cache key digest: %w", err)
 	}
 
 	key := newRemoteKey(fileSha, dst, compressedSha, diffID)
 
 	reader, err := encodeRemoteKey(key)
 	if err != nil {
-		return fmt.Errorf("failed to encode remote cache key %s: %w", keyDigest, err)
+		return 0, fmt.Errorf("failed to encode remote cache key %s: %w", keyDigest, err)
 	}
 
-	if err := c.remoteCache.PushKey(keyDigest, reader); err != nil {
-		return fmt.Errorf("failed to push remote cache key %s: %w", keyDigest, err)
+	retries, err := c.remoteCache.PushKey(keyDigest, reader)
+	if err != nil {
+		return retries, fmt.Errorf("failed to push remote cache key %s: %w", keyDigest, err)
 	}
 
 	log.Printf("Remote key %s [PUSHED] to remote cache\n", keyDigest)
 
-	return nil
+	return retries, nil
 }
 
-func (c *containerImage) lookupRemoteKey(fileSha string, dst []string) (filesystem.RemoteKey, bool, error) {
+func (c *containerImage) lookupRemoteKey(fileSha string, dst []string) (filesystem.RemoteKey, bool, int, error) {
 	var emptyKey filesystem.RemoteKey
 
 	if c.remoteCache == nil {
-		return emptyKey, false, nil
+		return emptyKey, false, 0, nil
 	}
 
 	keyDigest, err := remoteKeyDigest(fileSha, dst)
 	if err != nil {
-		return emptyKey, false, fmt.Errorf("failed to calculate remote cache key digest: %w", err)
+		return emptyKey, false, 0, fmt.Errorf(
+			"failed to calculate remote cache key digest: %w",
+			err,
+		)
 	}
 
-	reader, err := c.remoteCache.PullKey(keyDigest)
+	reader, retries, err := c.remoteCache.PullKey(keyDigest)
 	if err != nil {
 		if reader != nil {
 			_ = reader.Close()
@@ -1214,45 +1224,61 @@ func (c *containerImage) lookupRemoteKey(fileSha string, dst []string) (filesyst
 
 		if errors.Is(err, cache.ErrRemoteCacheMiss) {
 			log.Printf("Remote key %s [MISS] in remote cache\n", keyDigest)
-			return emptyKey, false, nil
+			return emptyKey, false, retries, nil
 		}
 
-		return emptyKey, false, fmt.Errorf("failed to pull remote cache key %s: %w", keyDigest, err)
+		return emptyKey, false, retries, fmt.Errorf(
+			"failed to pull remote cache key %s: %w",
+			keyDigest,
+			err,
+		)
 	}
 
 	if reader == nil {
-		return emptyKey, false, fmt.Errorf("remote cache returned a nil reader for key %s", keyDigest)
+		return emptyKey, false, retries, fmt.Errorf(
+			"remote cache returned a nil reader for key %s",
+			keyDigest,
+		)
 	}
 	defer reader.Close()
 
 	key, err := decodeRemoteKey(reader)
 	if err != nil {
-		return emptyKey, false, fmt.Errorf("failed to decode remote cache key %s: %w", keyDigest, err)
+		return emptyKey, false, retries, fmt.Errorf(
+			"failed to decode remote cache key %s: %w",
+			keyDigest,
+			err,
+		)
 	}
 
 	if err := validateRemoteKeyMatch(key, fileSha, dst, keyDigest); err != nil {
-		return emptyKey, false, fmt.Errorf("remote cache key %s failed semantic validation: %w", keyDigest, err)
+		return emptyKey, false, retries, fmt.Errorf(
+			"remote cache key %s failed semantic validation: %w",
+			keyDigest,
+			err,
+		)
 	}
 
 	log.Printf("Remote key %s [HIT] in remote cache\n", keyDigest)
-	return key, true, nil
+
+	return key, true, retries, nil
 }
 
-func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, int64, error) {
+func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, int64, int, error) {
 	if c.blobCache.Check(compressedSha) {
-		return true, 0, nil
+		return true, 0, 0, nil
 	}
 
 	if c.remoteCache == nil {
 		log.Printf("Blob %s [MISSING] in local cache and no remote cache configured\n", compressedSha)
-		return false, 0, nil
+		return false, 0, 0, nil
 	}
 
 	log.Printf("Blob %s [MISSING] in local cache, trying remote cache restore\n", compressedSha)
 
 	var totalBytesDownloaded int64
 
-	_, err := cache.RetryRemoteOperation("restore blob", func() error {
+	retries, err := cache.RetryRemoteOperation("restore blob", func() error {
 		reader, err := c.remoteCache.PullBlob(compressedSha)
 		if err != nil {
 			if reader != nil {
@@ -1333,10 +1359,10 @@ func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, int64, e
 	if err != nil {
 		if errors.Is(err, cache.ErrRemoteCacheMiss) {
 			log.Printf("Blob %s remote cache restore [MISS]: %v\n", compressedSha, err)
-			return false, totalBytesDownloaded, nil
+			return false, totalBytesDownloaded, retries, nil
 		}
 
-		return false, totalBytesDownloaded, fmt.Errorf(
+		return false, totalBytesDownloaded, retries, fmt.Errorf(
 			"Failed to pull blob %s from remote cache: %w",
 			compressedSha,
 			err,
@@ -1344,7 +1370,7 @@ func (c *containerImage) restoreRemoteBlob(compressedSha string) (bool, int64, e
 	}
 
 	log.Printf("Blob %s [RESTORED] from remote cache\n", compressedSha)
-	return true, totalBytesDownloaded, nil
+	return true, totalBytesDownloaded, retries, nil
 }
 
 func createFileWithDirs(p string) (*os.File, error) {

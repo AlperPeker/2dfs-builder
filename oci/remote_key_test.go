@@ -25,48 +25,48 @@ type fakeRemoteKeyCache struct {
 	pushedKeyData   []byte
 }
 
-func (f *fakeRemoteKeyCache) CheckBlob(compressedSha string) (bool, error) {
-	return false, nil
+func (f *fakeRemoteKeyCache) CheckBlob(compressedSha string) (bool, int, error) {
+	return false, 0, nil
 }
 
-func (f *fakeRemoteKeyCache) PushBlob(compressedSha string, reader io.Reader) error {
-	return nil
+func (f *fakeRemoteKeyCache) PushBlob(compressedSha string, reader io.Reader) (int, error) {
+	return 0, nil
 }
 
 func (f *fakeRemoteKeyCache) PullBlob(compressedSha string) (io.ReadCloser, error) {
 	return nil, cache.ErrRemoteCacheMiss
 }
 
-func (f *fakeRemoteKeyCache) PushKey(keyDigest string, reader io.Reader) error {
+func (f *fakeRemoteKeyCache) PushKey(keyDigest string, reader io.Reader) (int, error) {
 	f.pushKeyCalls++
 	f.pushedKeyDigest = keyDigest
 
 	if f.pushKeyErr != nil {
-		return f.pushKeyErr
+		return 0, f.pushKeyErr
 	}
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	f.pushedKeyData = append([]byte(nil), data...)
 
-	return nil
+	return 0, nil
 }
 
-func (f *fakeRemoteKeyCache) PullKey(keyDigest string) (io.ReadCloser, error) {
+func (f *fakeRemoteKeyCache) PullKey(keyDigest string) (io.ReadCloser, int, error) {
 	f.requestedKeyDigest = keyDigest
 
 	if f.pullKeyErr != nil {
-		return nil, f.pullKeyErr
+		return nil, 0, f.pullKeyErr
 	}
 
 	if f.returnNilReader {
-		return nil, nil
+		return nil, 0, nil
 	}
 
-	return io.NopCloser(bytes.NewReader(f.keyPayload)), nil
+	return io.NopCloser(bytes.NewReader(f.keyPayload)), 0, nil
 }
 
 func remoteKeyPayload(t *testing.T, key filesystem.RemoteKey) []byte {
@@ -99,7 +99,7 @@ func TestLookupRemoteKeyReturnsValidatedHit(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	key, found, err := container.lookupRemoteKey(fileSha, dst)
+	key, found, _, err := container.lookupRemoteKey(fileSha, dst)
 	if err != nil {
 		t.Fatalf("lookupRemoteKey returned error: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestLookupRemoteKeyReturnsMiss(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	key, found, err := container.lookupRemoteKey(
+	key, found, _, err := container.lookupRemoteKey(
 		"file-sha-test",
 		[]string{"./Dockerfile"},
 	)
@@ -167,7 +167,7 @@ func TestLookupRemoteKeyReturnsRegistryError(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	_, found, err := container.lookupRemoteKey(
+	_, found, _, err := container.lookupRemoteKey(
 		"file-sha-test",
 		[]string{"./Dockerfile"},
 	)
@@ -194,7 +194,7 @@ func TestLookupRemoteKeyRejectsInvalidJSON(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	_, found, err := container.lookupRemoteKey(
+	_, found, _, err := container.lookupRemoteKey(
 		"file-sha-test",
 		[]string{"./Dockerfile"},
 	)
@@ -231,7 +231,7 @@ func TestLookupRemoteKeyRejectsIdentityMismatch(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	_, found, err := container.lookupRemoteKey(expectedFileSha, dst)
+	_, found, _, err := container.lookupRemoteKey(expectedFileSha, dst)
 	if err == nil {
 		t.Fatalf("expected semantic identity validation error")
 	}
@@ -248,7 +248,7 @@ func TestLookupRemoteKeyRejectsIdentityMismatch(t *testing.T) {
 func TestLookupRemoteKeyWithoutRemoteCacheReturnsMiss(t *testing.T) {
 	container := &containerImage{}
 
-	key, found, err := container.lookupRemoteKey(
+	key, found, _, err := container.lookupRemoteKey(
 		"file-sha-test",
 		[]string{"./Dockerfile"},
 	)
@@ -274,7 +274,7 @@ func TestLookupRemoteKeyRejectsNilReader(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	_, found, err := container.lookupRemoteKey(
+	_, found, _, err := container.lookupRemoteKey(
 		"file-sha-test",
 		[]string{"./Dockerfile"},
 	)
@@ -304,7 +304,7 @@ func TestPublishRemoteKeyPublishesExpectedMetadata(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	err := container.publishRemoteKey(
+	_, err := container.publishRemoteKey(
 		fileSha,
 		dst,
 		compressedSha,
@@ -368,7 +368,7 @@ func TestPublishRemoteKeyReturnsPushError(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	err := container.publishRemoteKey(
+	_, err := container.publishRemoteKey(
 		"file-sha-test",
 		[]string{"./Dockerfile"},
 		"compressed-sha-test",
@@ -397,7 +397,7 @@ func TestPublishRemoteKeyReturnsPushError(t *testing.T) {
 func TestPublishRemoteKeyWithoutRemoteCacheDoesNothing(t *testing.T) {
 	container := &containerImage{}
 
-	err := container.publishRemoteKey(
+	_, err := container.publishRemoteKey(
 		"file-sha-test",
 		[]string{"./Dockerfile"},
 		"compressed-sha-test",

@@ -20,12 +20,12 @@ type fakeRemoteCache struct {
 	reader io.ReadCloser
 }
 
-func (f fakeRemoteCache) CheckBlob(compressedSha string) (bool, error) {
-	return false, nil
+func (f fakeRemoteCache) CheckBlob(compressedSha string) (bool, int, error) {
+	return false, 0, nil
 }
 
-func (f fakeRemoteCache) PushBlob(compressedSha string, r io.Reader) error {
-	return nil
+func (f fakeRemoteCache) PushBlob(compressedSha string, r io.Reader) (int, error) {
+	return 0, nil
 }
 
 func (f fakeRemoteCache) PullBlob(compressedSha string) (io.ReadCloser, error) {
@@ -36,12 +36,12 @@ func (f fakeRemoteCache) PullBlob(compressedSha string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(f.blob)), nil
 }
 
-func (f fakeRemoteCache) PushKey(keyDigest string, reader io.Reader) error {
-	return nil
+func (f fakeRemoteCache) PushKey(keyDigest string, reader io.Reader) (int, error) {
+	return 0, nil
 }
 
-func (f fakeRemoteCache) PullKey(keyDigest string) (io.ReadCloser, error) {
-	return nil, cache.ErrRemoteCacheMiss
+func (f fakeRemoteCache) PullKey(keyDigest string) (io.ReadCloser, int, error) {
+	return nil, 0, cache.ErrRemoteCacheMiss
 }
 
 type failingReadCloser struct {
@@ -93,12 +93,12 @@ type retryingRemoteCache struct {
 	failAfter int
 }
 
-func (f *retryingRemoteCache) CheckBlob(compressedSha string) (bool, error) {
-	return false, nil
+func (f *retryingRemoteCache) CheckBlob(compressedSha string) (bool, int, error) {
+	return false, 0, nil
 }
 
-func (f *retryingRemoteCache) PushBlob(compressedSha string, r io.Reader) error {
-	return nil
+func (f *retryingRemoteCache) PushBlob(compressedSha string, r io.Reader) (int, error) {
+	return 0, nil
 }
 
 func (f *retryingRemoteCache) PullBlob(compressedSha string) (io.ReadCloser, error) {
@@ -114,12 +114,12 @@ func (f *retryingRemoteCache) PullBlob(compressedSha string) (io.ReadCloser, err
 	return io.NopCloser(bytes.NewReader(f.blob)), nil
 }
 
-func (f *retryingRemoteCache) PushKey(keyDigest string, reader io.Reader) error {
-	return nil
+func (f *retryingRemoteCache) PushKey(keyDigest string, reader io.Reader) (int, error) {
+	return 0, nil
 }
 
-func (f *retryingRemoteCache) PullKey(keyDigest string) (io.ReadCloser, error) {
-	return nil, cache.ErrRemoteCacheMiss
+func (f *retryingRemoteCache) PullKey(keyDigest string) (io.ReadCloser, int, error) {
+	return nil, 0, cache.ErrRemoteCacheMiss
 }
 
 func TestNewRemoteCacheFromContext(t *testing.T) {
@@ -264,7 +264,7 @@ func TestRestoreRemoteBlobRestoresMatchingDigest(t *testing.T) {
 		},
 	}
 
-	available, _, err := container.restoreRemoteBlob(compressedSha)
+	available, _, _, err := container.restoreRemoteBlob(compressedSha)
 	if err != nil {
 		t.Fatalf("restoreRemoteBlob returned error: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestRestoreRemoteBlobRejectsDigestMismatch(t *testing.T) {
 		},
 	}
 
-	available, _, err := container.restoreRemoteBlob(compressedSha)
+	available, _, _, err := container.restoreRemoteBlob(compressedSha)
 	if err == nil {
 		t.Fatalf("expected digest mismatch error")
 	}
@@ -338,7 +338,7 @@ func TestRestoreRemoteBlobReturnsStreamError(t *testing.T) {
 		},
 	}
 
-	available, _, err := container.restoreRemoteBlob(
+	available, _, _, err := container.restoreRemoteBlob(
 		compressedSha,
 	)
 
@@ -384,13 +384,15 @@ func TestRestoreRemoteBlobRetriesInterruptedStream(t *testing.T) {
 		remoteCache: remoteCache,
 	}
 
-	available, bytesDownloaded, err := container.restoreRemoteBlob(compressedSha)
+	available, bytesDownloaded, retries, err := container.restoreRemoteBlob(compressedSha)
 	if err != nil {
 		t.Fatalf("restoreRemoteBlob returned error: %v", err)
 	}
 
 	if !available {
-		t.Fatal("expected blob to be restored after retry")
+		if retries != 1 {
+			t.Fatalf("expected 1 retry, got %d", retries)
+		}
 	}
 
 	if remoteCache.pullCalls != 2 {

@@ -42,6 +42,8 @@ type AllotmentMeasurement struct {
 	CompressionDuration       time.Duration
 	RemoteBlobPushDuration    time.Duration
 
+	RemoteRetryCount int
+
 	RemoteArtifactBytesDownloaded int64
 	RemoteArtifactBytesUploaded   int64
 }
@@ -71,6 +73,8 @@ type BuildSummary struct {
 
 	TotalArtifactBytesDownloaded int64
 	TotalArtifactBytesUploaded   int64
+
+	TotalRemoteRetryCount int
 }
 
 func newAllotmentMeasurement() AllotmentMeasurement {
@@ -126,6 +130,7 @@ func (m *BuildMeasurement) Summary() BuildSummary {
 
 		summary.TotalArtifactBytesDownloaded += allotment.RemoteArtifactBytesDownloaded
 		summary.TotalArtifactBytesUploaded += allotment.RemoteArtifactBytesUploaded
+		summary.TotalRemoteRetryCount += allotment.RemoteRetryCount
 	}
 
 	return summary
@@ -173,6 +178,7 @@ func (m BuildMeasurement) ExportCSV(outputDir string) (string, error) {
 		"build_duration_ms",
 		"compression_duration_ms",
 		"remote_blob_push_duration_ms",
+		"remote_retry_count",
 		"remote_artifact_bytes_downloaded",
 		"remote_artifact_bytes_uploaded",
 		"success",
@@ -186,6 +192,7 @@ func (m BuildMeasurement) ExportCSV(outputDir string) (string, error) {
 		"remote_blob_miss_count",
 		"total_artifact_bytes_downloaded",
 		"total_artifact_bytes_uploaded",
+		"total_remote_retry_count",
 	}
 
 	if err := writer.Write(header); err != nil {
@@ -208,6 +215,7 @@ func (m BuildMeasurement) ExportCSV(outputDir string) (string, error) {
 		"",
 		"",
 		"",
+		"",
 		fmt.Sprint(m.Success),
 		fmt.Sprint(summary.TotalAllotments),
 		fmt.Sprint(summary.LocalHitCount),
@@ -219,6 +227,7 @@ func (m BuildMeasurement) ExportCSV(outputDir string) (string, error) {
 		fmt.Sprint(summary.RemoteBlobMissCount),
 		fmt.Sprint(summary.TotalArtifactBytesDownloaded),
 		fmt.Sprint(summary.TotalArtifactBytesUploaded),
+		fmt.Sprint(summary.TotalRemoteRetryCount),
 	}
 
 	if err := writer.Write(summaryRow); err != nil {
@@ -238,8 +247,10 @@ func (m BuildMeasurement) ExportCSV(outputDir string) (string, error) {
 			durationMilliseconds(allotment.BuildDuration),
 			durationMilliseconds(allotment.CompressionDuration),
 			durationMilliseconds(allotment.RemoteBlobPushDuration),
+			fmt.Sprint(allotment.RemoteRetryCount),
 			fmt.Sprint(allotment.RemoteArtifactBytesDownloaded),
 			fmt.Sprint(allotment.RemoteArtifactBytesUploaded),
+			"",
 			"",
 			"",
 			"",
