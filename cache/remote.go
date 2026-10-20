@@ -1,12 +1,17 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -21,6 +26,11 @@ import (
 )
 
 var ErrRemoteCacheMiss = errors.New("remote cache entry not found")
+
+const (
+	remoteRetryMaxAttempts = 3
+	remoteRetryBaseDelay   = 100 * time.Millisecond
+)
 
 type RemoteCache interface {
 	CheckBlob(compressedSha string) (bool, error)
@@ -55,7 +65,12 @@ func (c *remoteCache) CheckBlob(compressedSha string) (bool, error) {
 		return false, err
 	}
 
-	img, err := remote.Image(ref, c.options...)
+	var img v1.Image
+	_, err = retryRemoteOperation("check blob", func() error {
+		var remoteErr error
+		img, remoteErr = remote.Image(ref, c.options...)
+		return remoteErr
+	})
 	if err != nil {
 		if isRemoteCacheMiss(err) {
 			return false, nil
@@ -86,7 +101,9 @@ func (c *remoteCache) PushBlob(compressedSha string, r io.Reader) error {
 		return err
 	}
 
-	err = remote.Write(ref, img, c.options...)
+	_, err = retryRemoteOperation("push blob", func() error {
+		return remote.Write(ref, img, c.options...)
+	})
 	if err != nil {
 		return fmt.Errorf("Failed to push blob image to remote cache: %w", err)
 	}
@@ -146,6 +163,77 @@ func isRemoteCacheMiss(err error) bool {
 	return errors.As(err, &transportErr) && transportErr.StatusCode == http.StatusNotFound
 }
 
+func isRetryableRemoteError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var transportErr *transport.Error
+	if errors.As(err, &transportErr) {
+		switch transportErr.StatusCode {
+		case http.StatusTooManyRequests,
+			http.StatusInternalServerError,
+			http.StatusBadGateway,
+			http.StatusServiceUnavailable,
+			http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ETIMEDOUT) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	return false
+}
+
+func retryRemoteOperation(operation string, fn func() error) (int, error) {
+	var err error
+	retries := 0
+
+	for attempt := 1; attempt <= remoteRetryMaxAttempts; attempt++ {
+		err = fn()
+		if err == nil {
+			return retries, nil
+		}
+
+		if !isRetryableRemoteError(err) {
+			return retries, err
+		}
+
+		if attempt == remoteRetryMaxAttempts {
+			return retries, err
+		}
+
+		delay := remoteRetryBaseDelay * time.Duration(1<<(attempt-1))
+
+		log.Printf("Remote operation %s failed on attempt %d/%d: %v; retrying in %s\n",
+			operation,
+			attempt,
+			remoteRetryMaxAttempts,
+			err,
+			delay)
+
+		retries++
+		time.Sleep(delay)
+	}
+
+	return retries, err
+}
+
 func validateLayerDigest(layer v1.Layer, expectedDigest string) error {
 	layerDigest, err := layer.Digest()
 	if err != nil {
@@ -166,11 +254,22 @@ func (c *remoteCache) PullBlob(compressedSha string) (io.ReadCloser, error) {
 		return nil, err
 	}
 
-	img, err := remote.Image(ref, c.options...)
+	var img v1.Image
+
+	_, err = retryRemoteOperation("pull blob", func() error {
+		var remoteErr error
+		img, remoteErr = remote.Image(ref, c.options...)
+		return remoteErr
+	})
+
 	if err != nil {
 		if isRemoteCacheMiss(err) {
-			return nil, fmt.Errorf("Blob %s not found in remote cache: %w", compressedSha, ErrRemoteCacheMiss)
+			return nil, fmt.Errorf("Blob %s not found in remote cache: %w",
+				compressedSha,
+				ErrRemoteCacheMiss,
+			)
 		}
+
 		return nil, fmt.Errorf("Failed to fetch blob from remote cache: %w", err)
 	}
 
@@ -179,12 +278,19 @@ func (c *remoteCache) PullBlob(compressedSha string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("Invalid blob image in remote cache: %w", err)
 	}
 
-	layers, err := img.Layers()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to get blob layers: %w", err)
-	}
+	var reader io.ReadCloser
 
-	reader, err := layers[0].Compressed()
+	_, err = retryRemoteOperation("open blob stream", func() error {
+		layers, remoteErr := img.Layers()
+		if remoteErr != nil {
+			return remoteErr
+		}
+
+		var openErr error
+		reader, openErr = layers[0].Compressed()
+		return openErr
+	})
+
 	if err != nil {
 		return nil, fmt.Errorf("Failed to open compressed blob layer from remote cache: %w", err)
 	}
@@ -203,7 +309,9 @@ func (c *remoteCache) PushKey(keyDigest string, reader io.Reader) error {
 		return err
 	}
 
-	err = remote.Write(ref, img, c.options...)
+	_, err = retryRemoteOperation("push key", func() error {
+		return remote.Write(ref, img, c.options...)
+	})
 	if err != nil {
 		return fmt.Errorf("Failed to push key image to remote cache: %w", err)
 	}
@@ -217,7 +325,14 @@ func (c *remoteCache) PullKey(keyDigest string) (io.ReadCloser, error) {
 		return nil, err
 	}
 
-	img, err := remote.Image(ref, c.options...)
+	var img v1.Image
+
+	_, err = retryRemoteOperation("pull key", func() error {
+		var remoteErr error
+		img, remoteErr = remote.Image(ref, c.options...)
+		return remoteErr
+	})
+
 	if err != nil {
 		if isRemoteCacheMiss(err) {
 			return nil, fmt.Errorf("Key %s not found in remote cache: %w", keyDigest, ErrRemoteCacheMiss)

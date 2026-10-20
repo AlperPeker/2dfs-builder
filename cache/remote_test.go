@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/registry"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 )
 
 func createTestTarGz(t *testing.T, name string, content []byte) []byte {
@@ -747,5 +748,86 @@ func TestPushKeyStoresKeyUnderKeyTagInRegistry(t *testing.T) {
 
 	if bytes.Contains(body, []byte("blob-sha256-abc123")) {
 		t.Fatalf("key was stored with blob tag instead of key tag")
+	}
+}
+
+func TestRetryRemoteOperationRetriesTransientError(t *testing.T) {
+	attempts := 0
+
+	retries, err := retryRemoteOperation("test operation", func() error {
+		attempts++
+
+		if attempts < 3 {
+			return &transport.Error{
+				StatusCode: http.StatusServiceUnavailable,
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("expected operation to succeed, got %v", err)
+	}
+
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts, got %d", attempts)
+	}
+
+	if retries != 2 {
+		t.Fatalf("expected 2 retries, got %d", retries)
+	}
+}
+
+func TestRetryRemoteOperationDoesNotRetryNotFound(t *testing.T) {
+	attempts := 0
+
+	retries, err := retryRemoteOperation("test operation", func() error {
+		attempts++
+
+		return &transport.Error{
+			StatusCode: http.StatusNotFound,
+		}
+	})
+
+	if err == nil {
+		t.Fatal("expected operation to return an error")
+	}
+
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt, got %d", attempts)
+	}
+
+	if retries != 0 {
+		t.Fatalf("expected 0 retries, got %d", retries)
+	}
+}
+
+func TestRetryRemoteOperationStopsAfterMaxAttempts(t *testing.T) {
+	attempts := 0
+
+	retries, err := retryRemoteOperation("test operation", func() error {
+		attempts++
+		return io.ErrUnexpectedEOF
+	})
+
+	if err == nil {
+		t.Fatal("expected operation to return an error")
+	}
+
+	if attempts != remoteRetryMaxAttempts {
+		t.Fatalf(
+			"expected %d attempts, got %d",
+			remoteRetryMaxAttempts,
+			attempts,
+		)
+	}
+
+	if retries != remoteRetryMaxAttempts-1 {
+		t.Fatalf(
+			"expected %d retries, got %d",
+			remoteRetryMaxAttempts-1,
+			retries,
+		)
 	}
 }
